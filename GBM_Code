@@ -1,0 +1,272 @@
+#Cleaning the data
+
+all_data <- readRDS("combined_dataset.rds")
+
+stock_list <- split(all_data, all_data$company)
+
+calculate_returns <- function(company_data) {
+  company_data <- company_data %>%
+    arrange(date) %>%        # lowercase 'date'
+    mutate(
+      Log_Return = log(close / lag(close))  # lowercase 'close'
+    ) %>%
+    filter(!is.na(Log_Return))
+  
+  return(company_data)
+}
+
+#Apply the function to all companies
+stock_list <- lapply(stock_list, calculate_returns)
+
+
+print(stock_list[[2]][1:5, c("company", "date", "close", "Log_Return")])
+
+all_data_with_returns <- bind_rows(stock_list)
+
+crisis_periods <- list(
+  dotcom_crash = c(as.Date("2000-01-01"), as.Date("2002-12-31")),
+  financial_crisis = c(as.Date("2008-01-01"), as.Date("2010-12-31")),
+  covid_crisis = c(as.Date("2020-01-01"), as.Date("2022-12-31"))
+)
+#Remove all crisis data
+all_data_clean <- all_data_with_returns %>%
+  filter(
+    !(date >= crisis_periods$dotcom_crash[1] & date <= crisis_periods$dotcom_crash[2]),
+    !(date >= crisis_periods$financial_crisis[1] & date <= crisis_periods$financial_crisis[2]),
+    !(date >= crisis_periods$covid_crisis[1] & date <= crisis_periods$covid_crisis[2])
+  )
+
+
+#Verify the periods we have left
+period_summary <- all_data_clean %>%
+  summarise(
+    Start_Date = min(date),
+    End_Date = max(date),
+    Total_Years = as.numeric(difftime(max(date), min(date), units = "days")) / 365.25
+  )
+print(period_summary)
+
+# Check data availability by year and company
+yearly_coverage <- all_data_with_returns %>%
+  mutate(Year = as.numeric(format(date, "%Y"))) %>%
+  group_by(Year, company) %>%
+  summarise(Days_Traded = n(), .groups = "drop")
+
+# Summary by year
+yearly_summary <- yearly_coverage %>%
+  group_by(Year) %>%
+  summarise(
+    Companies_Active = n_distinct(company),
+    Avg_Trading_Days = mean(Days_Traded),
+    Total_Observations = sum(Days_Traded)
+  )
+
+
+
+decade_summary <- yearly_summary %>%
+  mutate(Decade = floor(Year / 10) * 10) %>%
+  group_by(Decade) %>%
+  summarise(
+    Avg_Companies_Per_Year = mean(Companies_Active),
+    Total_Company_Years = sum(Companies_Active)
+  )
+print(decade_summary)
+
+# Check earliest data for each company
+company_start_dates <- all_data_with_returns %>%
+  group_by(company) %>%
+  summarise(
+    Start_Year = min(as.numeric(format(date, "%Y"))),
+    End_Year = max(as.numeric(format(date, "%Y"))),
+    Total_Years = End_Year - Start_Year + 1
+  ) %>%
+  arrange(Start_Year)
+
+analysis_periods <- list(
+  early_period = c(as.Date("1986-01-01"), as.Date("1999-12-31")),  
+  post_dotcom = c(as.Date("2002-01-01"), as.Date("2006-12-31")),  
+  modern_stable = c(as.Date("2010-01-01"), as.Date("2019-12-31")),
+  post_covid = c(as.Date("2022-01-01"), as.Date("2025-12-31"))     
+)
+
+####################################################################
+
+decade_periods <- list(
+  eighties = c(as.Date("1986-01-01"), as.Date("1989-12-31")),  # 1986-1989 (4 years)
+  nineties = c(as.Date("1990-01-01"), as.Date("1999-12-31")),  # 1990-1999 (10 years)
+  two_thousands = c(as.Date("2002-01-01"), as.Date("2006-12-31")),  # 2002-2006 (5 years - missing 2000-2001, 2007-2009)
+  twenty_tens = c(as.Date("2010-01-01"), as.Date("2019-12-31")),   # 2010-2019 (10 years)
+  twenty_twenties = c(as.Date("2022-01-01"), as.Date("2025-12-31")) # 2022-2024 (3 years - missing 2020-2021)
+)
+
+all_data_clean <- all_data_clean %>%
+  mutate(
+    decade = case_when(
+      date >= as.Date("1986-01-01") & date <= as.Date("1989-12-31") ~ "1980s",
+      date >= as.Date("1990-01-01") & date <= as.Date("1999-12-31") ~ "1990s", 
+      date >= as.Date("2002-01-01") & date <= as.Date("2006-12-31") ~ "2000s",
+      date >= as.Date("2010-01-01") & date <= as.Date("2019-12-31") ~ "2010s",
+      date >= as.Date("2022-01-01") & date <= as.Date("2024-12-31") ~ "2020s",
+      TRUE ~ "Excluded"
+    )
+  ) %>%
+  filter(decade != "Excluded")
+
+#Remove the outliers using our bound  
+GBM_analysis_super_cleaned_data <- all_data_clean %>%
+  filter(Log_Return > log(0.01) & Log_Return < log(2.0))  # -99% to +100% simple returns
+
+##decade analysis 
+
+
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(knitr)
+#company-level test results 
+company_test_results <- GBM_analysis_super_cleaned_data %>%
+  group_by(decade, company) %>%
+  summarise(
+    jb_pvalue = tseries::jarque.bera.test(Log_Return)$p.value,
+    ljung_pvalue = Box.test(Log_Return, lag = 1, type = "Ljung-Box")$p.value,
+    acf_lag1 = acf(Log_Return, plot = FALSE)$acf[2,1,1],
+    volatility = sd(Log_Return, na.rm = TRUE),
+    skewness = moments::skewness(Log_Return, na.rm = TRUE),
+    kurtosis = moments::kurtosis(Log_Return, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    jb_rejects_normality = jb_pvalue < 0.05,
+    ljung_rejects_independence = ljung_pvalue < 0.05,
+    significant_acf = abs(acf_lag1) > 0.05
+  )
+
+#Calculate percentages for each test by decade
+rejection_percentages <- company_test_results %>%
+  group_by(decade) %>%
+  summarise(
+    n_companies = n(),
+    pct_jb_reject = mean(jb_rejects_normality) * 100,
+    pct_ljung_reject = mean(ljung_rejects_independence) * 100,
+    pct_significant_acf = mean(significant_acf) * 100,
+    mean_volatility = mean(volatility),
+    mean_skewness = mean(skewness),
+    mean_kurtosis = mean(kurtosis),
+    .groups = 'drop'
+  )
+
+#1.Mean Volatility (Top Left - Dark Blue)
+p1 <- ggplot(rejection_percentages, aes(x = decade, y = mean_volatility)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  labs(title = "Volatility by Decade",
+       y = "Volatility", x = "") +
+  theme_minimal()
+
+#2.Mean Skewness (Top Middle - Green)
+p2 <- ggplot(rejection_percentages, aes(x = decade, y = mean_skewness)) +
+  geom_bar(stat = "identity", fill = "green") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Skewness by Decade",
+       y = "Skewness", x = "") +
+  theme_minimal()
+
+#3.Mean Kurtosis (Top Right - Pink)
+p3 <- ggplot(rejection_percentages, aes(x = decade, y = mean_kurtosis)) +
+  geom_bar(stat = "identity", fill = "salmon") +
+  geom_hline(yintercept = 3, linetype = "dashed", color = "red") +
+  labs(title = "Kurtosis by Decade",
+       y = "Kurtosis", x = "") +
+  theme_minimal()
+
+#4. % Companies Rejecting Normality (Bottom Left - Yellow)
+p4 <- ggplot(rejection_percentages, aes(x = decade, y = pct_jb_reject)) +
+  geom_bar(stat = "identity", fill = "gold") +
+  labs(title = "% Rejecting Normality ",
+       y = "Percentage (%)", x = "Decade") +
+  ylim(0, 100) +
+  theme_minimal()
+
+#5. % Companies Rejecting Independence (Bottom Middle - Purple)
+p5 <- ggplot(rejection_percentages, aes(x = decade, y = pct_ljung_reject)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  labs(title = "% Rejecting Independence ",
+       y = "Percentage (%)", x = "Decade") +
+  ylim(0, 100) +
+  theme_minimal()
+
+acf_data <- company_test_results %>%
+  group_by(decade) %>%
+  summarise(mean_acf_lag1 = mean(acf_lag1, na.rm = TRUE))
+
+p6 <- ggplot(acf_data, aes(x = decade, y = mean_acf_lag1)) +
+  geom_bar(stat = "identity", fill = "red") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "ACF at Lag 1",
+       y = "Autocorrelation", x = "Decade") +
+  theme_minimal()
+
+
+# Arrange in 2x3 grid
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 3, nrow = 2)
+
+# Create Q-Q plots for each decade
+qq_plots <- list()
+
+# Get the decades from your data
+decades <- sort(unique(GBM_analysis_super_cleaned_data$decade))
+
+# Create a Q-Q plot for each decade
+for(i in seq_along(decades)) {
+  current_decade <- decades[i]
+  
+  # Filter data for the current decade
+  decade_data <- GBM_analysis_super_cleaned_data %>% filter(decade == current_decade)
+  
+  # Create Q-Q plot
+  qq_plots[[i]] <- ggplot(decade_data, aes(sample = Log_Return)) +
+    stat_qq(size = 0.5, alpha = 0.3) +
+    stat_qq_line(color = "red", linewidth = 0.8) +
+    labs(title = paste(current_decade, "Q-Q Plot"),
+         x = "Theoretical Quantiles", 
+         y = "Sample Quantiles") +
+    theme_minimal()
+}
+
+# Arrange all Q-Q plots in a grid
+grid.arrange(grobs = qq_plots, ncol = 3, nrow = 2)
+
+#Ljung box test numbers
+ljung_numbers <- rejection_percentages %>%
+  select(decade, n_companies, pct_ljung_reject) %>%
+  mutate(
+    companies_rejecting = round((pct_ljung_reject / 100) * n_companies)
+  )
+
+print(ljung_numbers, n = Inf)
+
+
+#all numerical findings
+#Display comprehensive numerical results from all tests
+comprehensive_results <- rejection_percentages %>%
+  select(
+    decade,
+    n_companies,
+    # Statistical test rejection percentages
+    pct_jb_reject,
+    pct_ljung_reject, 
+    pct_significant_acf,
+    # Distribution properties
+    mean_volatility,
+    mean_skewness,
+    mean_kurtosis
+  ) %>%
+  mutate(
+    # Add actual counts for rejections
+    jb_reject_count = round((pct_jb_reject / 100) * n_companies),
+    ljung_reject_count = round((pct_ljung_reject / 100) * n_companies),
+    significant_acf_count = round((pct_significant_acf / 100) * n_companies)
+  )
+
+# Print the complete numerical findings
+print(comprehensive_results, n = Inf)
